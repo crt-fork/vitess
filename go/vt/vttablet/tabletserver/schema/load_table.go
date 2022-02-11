@@ -25,7 +25,7 @@ import (
 
 	"vitess.io/vitess/go/sqltypes"
 	"vitess.io/vitess/go/vt/mysqlctl"
-
+	querypb "vitess.io/vitess/go/vt/proto/query"
 	"vitess.io/vitess/go/vt/sqlparser"
 	"vitess.io/vitess/go/vt/vttablet/tabletserver/connpool"
 )
@@ -64,21 +64,6 @@ func fetchColumns(ta *Table, conn *connpool.DBConn, databaseName, sqlTableName s
 }
 
 func loadMessageInfo(ta *Table, comment string) error {
-	hiddenCols := map[string]struct{}{
-		"priority":   {},
-		"time_next":  {},
-		"epoch":      {},
-		"time_acked": {},
-	}
-
-	requiredCols := []string{
-		"id",
-		"priority",
-		"time_next",
-		"epoch",
-		"time_acked",
-	}
-
 	ta.MessageInfo = &MessageInfo{}
 	// Extract keyvalues.
 	keyvals := make(map[string]string)
@@ -117,6 +102,23 @@ func loadMessageInfo(ta *Table, comment string) error {
 
 	ta.MessageInfo.MaxBackoff, _ = getDuration(keyvals, "vt_max_backoff")
 
+	// configure the columns that will be loaded into memory and streamed to subscribers
+	hiddenCols := map[string]struct{}{
+		"priority":   {},
+		"time_next":  {},
+		"epoch":      {},
+		"time_acked": {},
+	}
+
+	requiredCols := []string{
+		"id",
+		"priority",
+		"time_next",
+		"epoch",
+		"time_acked",
+	}
+
+	// make sure required columns are present
 	for _, col := range requiredCols {
 		num := ta.FindColumn(sqlparser.NewColIdent(col))
 		if num == -1 {
@@ -124,13 +126,25 @@ func loadMessageInfo(ta *Table, comment string) error {
 		}
 	}
 
-	// Load user-defined columns. Any "unrecognized" column is user-defined.
-	for _, field := range ta.Fields {
-		if _, ok := hiddenCols[strings.ToLower(field.Name)]; ok {
-			continue
+	allowedStreamingCols, _ := getCols(keyvals, "vt_stream_cols")
+
+	// make sure that all the specified columns are present
+	for _, col := range allowedStreamingCols {
+		num := ta.FindColumn(sqlparser.NewColIdent(col))
+		if num == -1 {
+			return fmt.Errorf("%s missing from message table: %s", col, ta.Name.String())
 		}
-		ta.MessageInfo.Fields = append(ta.MessageInfo.Fields, field)
 	}
+
+	if len(allowedStreamingCols) > 0 {
+		if allowedStreamingCols[0] != "id" {
+			return fmt.Errorf("vt_stream_cols must begin with id: %s", ta.Name.String())
+		}
+		ta.MessageInfo.Fields = getAllowedMessageFields(ta.Fields, allowedStreamingCols)
+	} else {
+		ta.MessageInfo.Fields = getDefaultMessageFields(ta.Fields, hiddenCols)
+	}
+
 	return nil
 }
 
@@ -156,4 +170,40 @@ func getNum(in map[string]string, key string) (int, error) {
 		return 0, err
 	}
 	return v, nil
+}
+
+func getCols(in map[string]string, key string) ([]string, error) {
+	sv := in[key]
+	if sv == "" {
+		return nil, fmt.Errorf("attribute %s not specified for message table", key)
+	}
+	cols := strings.Split(sv, ";")
+	return cols, nil
+}
+
+func getDefaultMessageFields(tableFields []*querypb.Field, hiddenCols map[string]struct{}) []*querypb.Field {
+	fields := make([]*querypb.Field, 0, len(tableFields))
+	// Load user-defined columns. Any "unrecognized" column is user-defined.
+	for _, field := range tableFields {
+		if _, ok := hiddenCols[strings.ToLower(field.Name)]; ok {
+			continue
+		}
+
+		fields = append(fields, field)
+	}
+	return fields
+}
+
+func getAllowedMessageFields(tableFields []*querypb.Field, streamCols []string) []*querypb.Field {
+	fields := make([]*querypb.Field, 0, len(streamCols))
+	// Load user-defined columns. Any "unrecognized" column is user-defined.
+	for _, col := range streamCols {
+		for _, field := range tableFields {
+			if field.Name == col {
+				fields = append(fields, field)
+				break
+			}
+		}
+	}
+	return fields
 }
